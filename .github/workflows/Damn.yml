@@ -3,25 +3,80 @@ name: Compare Good vs Bad Commit
 on:
   workflow_dispatch:
     inputs:
+      branch:
+        description: "Branch yang diperiksa"
+        default: "legacy"
       good_sha:
-        description: "Commit yang build-nya HIJAU"
+        description: "Commit HIJAU (boleh kosong / tidak ada, nanti dicari lewat waktu)"
         default: "62d8060cb0622e0bfcf55e68b865a6099c5e3c02"
       bad_sha:
-        description: "Commit yang build-nya MERAH"
+        description: "Commit MERAH (boleh kosong / tidak ada, nanti dicari lewat waktu)"
         default: "64a8d4dc34ff3454df3b5c3f49dec608f1e5d628"
+      good_time:
+        description: "Waktu run hijau (UTC), dipakai jika good_sha tidak ada"
+        default: "2026-11-17T13:37:00Z"
+      bad_time:
+        description: "Waktu run merah (UTC), dipakai jika bad_sha tidak ada"
+        default: "2026-11-18T08:53:00Z"
 
 jobs:
+  resolve:
+    name: Resolve commits
+    runs-on: ubuntu-latest
+    outputs:
+      good: ${{ steps.r.outputs.good }}
+      bad: ${{ steps.r.outputs.bad }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - id: r
+        env:
+          BRANCH: ${{ inputs.branch }}
+          GOOD_IN: ${{ inputs.good_sha }}
+          BAD_IN: ${{ inputs.bad_sha }}
+          GOOD_T: ${{ inputs.good_time }}
+          BAD_T: ${{ inputs.bad_time }}
+        run: |
+          git fetch --no-tags origin "$BRANCH" || true
+          resolve() {
+            if [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; then
+              echo "$(git rev-parse "$1")"; return
+            fi
+            git rev-list -1 --before="$2" "origin/$BRANCH"
+          }
+          GOOD=$(resolve "$GOOD_IN" "$GOOD_T")
+          BAD=$(resolve "$BAD_IN" "$BAD_T")
+          echo "good=$GOOD" >> "$GITHUB_OUTPUT"
+          echo "bad=$BAD" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Commit yang dipakai"
+            echo "- good: \`$GOOD\` (input: \`$GOOD_IN\` -> $(git cat-file -e "$GOOD_IN^{commit}" 2>/dev/null && echo ADA || echo TIDAK ADA di repo ini, dicari lewat waktu))"
+            echo "- bad: \`$BAD\` (input: \`$BAD_IN\` -> $(git cat-file -e "$BAD_IN^{commit}" 2>/dev/null && echo ADA || echo TIDAK ADA di repo ini, dicari lewat waktu))"
+            echo
+            echo "## Riwayat $BRANCH sejak 16 Nov 2026"
+            echo '```'
+            git log "origin/$BRANCH" --since=2026-11-16 --format='%h %cI %an  %s' | head -80
+            echo '```'
+            echo "(Kalau kosong, riwayat branch ini memang tidak punya commit pada rentang itu.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GOOD" = "$BAD" ] || [ -z "$GOOD" ] || [ -z "$BAD" ]; then
+            echo "::warning::good dan bad sama atau kosong; cek input waktu/branch."
+          fi
+
   inspect:
     name: Inspect ${{ matrix.label }}
+    needs: resolve
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: good
-            sha: ${{ inputs.good_sha }}
+            sha: ${{ needs.resolve.outputs.good }}
           - label: bad
-            sha: ${{ inputs.bad_sha }}
+            sha: ${{ needs.resolve.outputs.bad }}
     steps:
       - name: Checkout ${{ matrix.label }} commit
         uses: actions/checkout@v4
@@ -87,12 +142,13 @@ jobs:
 
   compare:
     name: Compare good vs bad
-    needs: inspect
+    needs: [resolve, inspect]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
 
       - name: Download reports
@@ -102,8 +158,8 @@ jobs:
 
       - name: Build comparison
         env:
-          GOOD: ${{ inputs.good_sha }}
-          BAD: ${{ inputs.bad_sha }}
+          GOOD: ${{ needs.resolve.outputs.good }}
+          BAD: ${{ needs.resolve.outputs.bad }}
         run: |
           mkdir -p out
           O=out/comparison.md
