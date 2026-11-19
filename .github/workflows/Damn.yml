@@ -1,0 +1,186 @@
+name: Compare Good vs Bad Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      good_sha:
+        description: "Commit yang build-nya HIJAU"
+        default: "62d8060cb0622e0bfcf55e68b865a6099c5e3c02"
+      bad_sha:
+        description: "Commit yang build-nya MERAH"
+        default: "64a8d4dc34ff3454df3b5c3f49dec608f1e5d628"
+
+jobs:
+  inspect:
+    name: Inspect ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: good
+            sha: ${{ inputs.good_sha }}
+          - label: bad
+            sha: ${{ inputs.bad_sha }}
+    steps:
+      - name: Checkout ${{ matrix.label }} commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+
+      - name: Collect source info
+        run: |
+          mkdir -p report
+          R=report
+          git log -1 --format='sha: %H%nauthor: %an <%ae>%ndate: %cI%nsubject: %s' > $R/commit.txt
+          # hash setiap file (blob) -> bisa di-diff antar commit
+          git ls-tree -r HEAD > $R/tree.txt
+          # semua import (dan import wildcard) di source
+          grep -rhn "^import " source --include=*.hx | sed 's/^[0-9]*://' | sort -u > $R/imports.txt || true
+          grep -rn "import .*\*;" source --include=*.hx | sort > $R/wildcard-imports.txt || true
+          # siapa saja yang menyebut class di rantai yang loop
+          grep -rln "TreeMenu\|UIState\|OptionsScreen\|OptionsTree" source --include=*.hx | sort > $R/refs-treemenu.txt || true
+          # fungsi tanpa tipe return di file-file kunci
+          for f in source/funkin/options/TreeMenu.hx source/funkin/options/OptionsTree.hx \
+                   source/funkin/options/OptionsScreen.hx source/funkin/editors/ui/UIState.hx \
+                   source/funkin/editors/EditorTreeMenu.hx source/funkin/backend/MusicBeatState.hx; do
+            echo "== $f" >> $R/untyped-functions.txt
+            grep -n "function [A-Za-z_0-9]*([^)]*)[[:space:]]*{\?[[:space:]]*$" "$f" 2>/dev/null >> $R/untyped-functions.txt || true
+          done
+          # file konfigurasi build
+          cp project.xml $R/project.xml 2>/dev/null || true
+          cp commandline/libs.xml $R/libs.xml 2>/dev/null || true
+          cp hmm.json $R/hmm.json 2>/dev/null || true
+          ls .github/workflows > $R/workflows-list.txt 2>/dev/null || true
+          cat .github/workflows/*.yml > $R/workflows-all.txt 2>/dev/null || true
+
+      - name: Setting up Haxe
+        uses: krdlab/setup-haxe@v2
+        with:
+          haxe-version: 4.3.7
+
+      - name: Install libraries (sama seperti build asli)
+        run: |
+          haxe -cp commandline -D analyzer-optimize --run Main setup -s
+
+      - name: Collect library info
+        run: |
+          R=report
+          {
+            echo "### haxelib list"
+            haxelib list || true
+            echo
+            echo "### commit setiap library git"
+            for g in $(find . "$(haxelib config 2>/dev/null)" -maxdepth 4 -name .git 2>/dev/null | grep -v "^./.git$"); do
+              d=$(dirname "$g")
+              echo "$d  $(git -C "$d" rev-parse HEAD 2>/dev/null)  $(git -C "$d" log -1 --format=%cI 2>/dev/null)  $(git -C "$d" remote get-url origin 2>/dev/null)"
+            done
+          } > $R/libs.txt
+          cat $R/libs.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.label }}
+          path: report
+
+  compare:
+    name: Compare good vs bad
+    needs: inspect
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+
+      - name: Build comparison
+        env:
+          GOOD: ${{ inputs.good_sha }}
+          BAD: ${{ inputs.bad_sha }}
+        run: |
+          mkdir -p out
+          O=out/comparison.md
+          {
+            echo "# Perbandingan commit"
+            echo
+            echo "- GOOD (hijau): \`$GOOD\`"
+            echo "- BAD (merah): \`$BAD\`"
+            echo
+            if git merge-base --is-ancestor "$GOOD" "$BAD"; then
+              echo "GOOD adalah leluhur BAD: perubahan ada di antara keduanya."
+            else
+              echo "PERHATIAN: GOOD bukan leluhur BAD (beda cabang/riwayat)."
+            fi
+            echo
+            echo "## 1. Commit di antara keduanya"
+            echo '```'
+            git log --format='%h %cI %an  %s' "$GOOD..$BAD"
+            echo '```'
+            echo
+            echo "## 2. File yang berubah"
+            echo '```'
+            git diff --name-status "$GOOD" "$BAD"
+            echo '```'
+            echo
+            echo "## 3. Ringkasan jumlah baris"
+            echo '```'
+            git diff --stat "$GOOD" "$BAD" | tail -n 60
+            echo '```'
+            echo
+            echo "## 4. Perubahan import"
+            echo '```diff'
+            diff reports/report-good/imports.txt reports/report-bad/imports.txt || true
+            echo '```'
+            echo
+            echo "## 5. Import wildcard (.*)"
+            echo '```diff'
+            diff reports/report-good/wildcard-imports.txt reports/report-bad/wildcard-imports.txt || true
+            echo '```'
+            echo
+            echo "## 6. File yang menyebut TreeMenu/UIState/OptionsScreen/OptionsTree"
+            echo '```diff'
+            diff reports/report-good/refs-treemenu.txt reports/report-bad/refs-treemenu.txt || true
+            echo '```'
+            echo
+            echo "## 7. Fungsi tanpa tipe return di file kunci"
+            echo '```diff'
+            diff reports/report-good/untyped-functions.txt reports/report-bad/untyped-functions.txt || true
+            echo '```'
+            echo
+            echo "## 8. Library git (apakah berubah?)"
+            echo '```diff'
+            diff <(awk '{print $1,$2,$4}' reports/report-good/libs.txt) \
+                 <(awk '{print $1,$2,$4}' reports/report-bad/libs.txt) || true
+            echo '```'
+            echo "(Kedua job memasang library pada waktu yang sama, jadi bagian ini hampir pasti kosong."
+            echo "Untuk membandingkan dengan saat build lama, lihat tanggal commit library di libs.txt.)"
+            echo
+            echo "## 9. Konfigurasi build (project.xml, libs.xml, hmm.json, workflow)"
+            for f in project.xml libs.xml hmm.json workflows-all.txt; do
+              echo "### $f"
+              echo '```diff'
+              diff reports/report-good/$f reports/report-bad/$f 2>&1 || true
+              echo '```'
+            done
+            echo
+            echo "## 10. Diff isi file di area yang dicurigai"
+            echo '```diff'
+            git diff "$GOOD" "$BAD" -- source/funkin/options source/funkin/editors source/funkin/backend/MusicBeatState.hx source/mobile | head -c 200000
+            echo '```'
+          } > $O
+          # ringkasan di halaman run (maks ~1MB)
+          head -c 900000 $O >> "$GITHUB_STEP_SUMMARY"
+          git diff "$GOOD" "$BAD" > out/full.diff || true
+
+      - name: Upload comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison
+          path: out
